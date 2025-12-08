@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .db import Base, engine
-from .routers import manufacturers, parks, coasters
+from .routers import manufacturers, parks, coasters, suggestions
 
 # Tabellen aanmaken (SQLite)
 Base.metadata.create_all(bind=engine)
@@ -40,3 +40,4 @@ def root():
 app.include_router(manufacturers.router)
 app.include_router(parks.router)
 app.include_router(coasters.router)
+app.include_router(suggestions.router)

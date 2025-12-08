@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, DateTime, Integer
+from sqlalchemy import Column, String, DateTime, Integer, Float, JSON, Text
 from sqlalchemy.sql import func
 
 from .db import Base
@@ -45,7 +45,7 @@ class Coaster(Base):
 
     # Basis-kenmerken – optioneel, voor toekomstige uitbreiding
     opening_year = Column(Integer, nullable=True)
-    height_m = Column(Integer, nullable=True)
+    height_m = Column(Float, nullable=True)
     speed_kmh = Column(Integer, nullable=True)
     status = Column(String, nullable=True)  # bv. "Operating", "Closed"
     notes = Column(String, nullable=True)
@@ -54,3 +54,41 @@ class Coaster(Base):
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+class DataSuggestion(Base):
+    """
+    Bufferlaag voor AI/crawler-voorstellen.
+    Bevat alleen 'voorstellen', de echte data staat in Manufacturer/Park/Coaster.
+    """
+
+    __tablename__ = "data_suggestions"
+
+    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+
+    # Voor welk type entity dit geldt
+    # bv. "manufacturer", "park" of "coaster"
+    entity_type = Column(String, nullable=False)
+
+    # Optioneel: bestaande entity waar dit voorstel bij hoort
+    # Bij nieuwe entiteiten kan dit None zijn (later uitbouwen)
+    entity_id = Column(String, nullable=True, index=True)
+
+    # Waar komt dit voorstel vandaan? (bv. website park/manufacturer, RCDB, etc.)
+    source_url = Column(String, nullable=True)
+
+    # Vrije set voorgestelde velden (nu weinig, later meer)
+    suggested_data = Column(JSON, nullable=False)
+
+    # Optioneel: snapshot van huidige waarden (voor vergelijking)
+    current_data = Column(JSON, nullable=True)
+
+    # Workflow-status
+    # "pending"  = moet nog beoordeeld worden
+    # "accepted" = toegepast op de echte tabel
+    # "rejected" = bewust afgewezen
+    status = Column(String, nullable=False, default="pending")
+
+    review_note = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)

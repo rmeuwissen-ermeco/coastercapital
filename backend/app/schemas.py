@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Any, Dict, Literal
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -79,9 +79,9 @@ class CoasterBase(BaseModel):
     opening_year: Optional[int] = Field(
         None, ge=1800, le=2100, description="Jaar van opening"
     )
-    height_m: Optional[int] = Field(
-        None, ge=0, le=200, description="Hoogte in meters"
-    )
+    height_m: Optional[float] = Field(
+    None, ge=0, le=200, description="Hoogte in meters"
+)
     speed_kmh: Optional[int] = Field(
         None, ge=0, le=250, description="Snelheid in km/h"
     )
@@ -98,7 +98,7 @@ class CoasterUpdate(BaseModel):
     park_id: Optional[str] = Field(None, min_length=1)
     manufacturer_id: Optional[str] = None
     opening_year: Optional[int] = Field(None, ge=1800, le=2100)
-    height_m: Optional[int] = Field(None, ge=0, le=200)
+    height_m: Optional[float] = Field(None, ge=0, le=200)
     speed_kmh: Optional[int] = Field(None, ge=0, le=250)
     status: Optional[str] = None
     notes: Optional[str] = None
@@ -111,3 +111,47 @@ class CoasterRead(CoasterBase):
 
     class Config:
         from_attributes = True
+
+
+# ---------- DataSuggestions ----------
+
+
+class DataSuggestionBase(BaseModel):
+    entity_type: Literal["manufacturer", "park", "coaster"]
+    entity_id: Optional[str] = Field(
+        None, description="ID van bestaande entiteit; None voor nieuwe entiteit"
+    )
+    source_url: Optional[str] = None
+
+    # Vrije JSON-payload met voorgestelde waarden (generiek / toekomstbestendig)
+    suggested_data: Dict[str, Any]
+    current_data: Optional[Dict[str, Any]] = None
+
+
+class DataSuggestionCreate(DataSuggestionBase):
+    """
+    Wordt gebruikt door crawler/AI of test tools om een nieuw voorstel te registreren.
+    Status is impliciet 'pending'.
+    """
+
+    pass
+
+
+class DataSuggestionRead(DataSuggestionBase):
+    id: str
+    status: str
+    review_note: Optional[str] = None
+    created_at: datetime
+    reviewed_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DataSuggestionReview(BaseModel):
+    """
+    Body voor accept/reject-acties in de API.
+    """
+
+    action: Literal["accept", "reject"]
+    review_note: Optional[str] = None
