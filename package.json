@@ -1,0 +1,9 @@
+{
+  "name": "coastercapital-root",
+  "private": true,
+  "scripts": {
+    "dev": "node dev.js"
+  }
+}
+
+
