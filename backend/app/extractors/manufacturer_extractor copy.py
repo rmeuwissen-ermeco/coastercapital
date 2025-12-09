@@ -5,7 +5,6 @@ from typing import Dict, Any, List
 from bs4 import BeautifulSoup, Tag
 
 from .base_extractor import BaseExtractor
-from ..ai.client import summarize_company_text
 
 
 class ManufacturerExtractor(BaseExtractor):
@@ -15,9 +14,11 @@ class ManufacturerExtractor(BaseExtractor):
     Doel:
     - Officiële naam zo goed mogelijk vinden (schema.org, og:site_name, og:title, title)
     - Land-code voorzichtig afleiden uit adres/headquarters informatie
-    - Korte beschrijving voor 'notes' maken:
-      * eerst via LLM als OPENAI_API_KEY beschikbaar is
-      * anders via heuristiek op HTML
+    - Korte beschrijving voor 'notes' maken op basis van about/company-sectie
+
+    Belangrijk:
+    - We vullen alleen velden in die we met redelijke zekerheid weten
+    - Geen nieuwe velden introduceren, alleen: name, country_code, notes
     """
 
     def extract(self, soup: BeautifulSoup, text: str) -> Dict[str, Any]:
@@ -31,7 +32,7 @@ class ManufacturerExtractor(BaseExtractor):
         if country_code:
             suggested["country_code"] = country_code
 
-        notes = self._extract_notes_with_ai(soup, text)
+        notes = self._extract_notes(soup, text)
         if notes:
             suggested["notes"] = notes
 
@@ -91,6 +92,7 @@ class ManufacturerExtractor(BaseExtractor):
         - "Vekoma | Coasters & Rides" -> "Vekoma"
         """
 
+        # splitsen op veel gebruikte scheidingstekens
         parts = (
             raw_title.split(" | ")[0]
             .split(" – ")[0]
@@ -109,7 +111,7 @@ class ManufacturerExtractor(BaseExtractor):
         Strategie:
         - Eerst kijken naar regels waarin woorden als 'headquarters', 'based in',
           'located in' voorkomen, en daarbinnen naar landnamen zoeken.
-        - Daarna naar adressen/contactblokken in HTML.
+        - Pas als dat niets oplevert eventueel fallback naar globale tekst.
         - Beter geen land invullen dan een verkeerde land-code.
         """
 
@@ -141,6 +143,7 @@ class ManufacturerExtractor(BaseExtractor):
         lower_text = text.lower()
         lines = [line.strip() for line in lower_text.splitlines() if line.strip()]
 
+        # Woorden die duiden op hoofdvestiging/adres
         hq_keywords = [
             "headquarters",
             "head office",
@@ -151,9 +154,9 @@ class ManufacturerExtractor(BaseExtractor):
             "headquarter",
         ]
 
+        # 1) Eerst: regels met hq-keywords
         candidate_scores: Dict[str, int] = {}
 
-        # 1) Eerst regels met hq-keywords
         for line in lines:
             if any(k in line for k in hq_keywords):
                 for phrase, code in country_map.items():
@@ -161,11 +164,14 @@ class ManufacturerExtractor(BaseExtractor):
                         candidate_scores[code] = candidate_scores.get(code, 0) + 2
 
         if candidate_scores:
+            # Kies het land met de hoogste score
             best_code = max(candidate_scores, key=candidate_scores.get)
+            # Alleen invullen als we een duidelijke winnaar hebben
             if candidate_scores[best_code] >= 2:
                 return best_code
 
-        # 2) Fallback: adressen/contactblokken in HTML
+        # 2) Fallback: zoeken in contact/adres blokken in HTML
+        #    We kijken naar <address> en elementen met 'contact' in de id/class.
         address_candidates: List[str] = []
 
         for addr in soup.find_all("address"):
@@ -194,50 +200,35 @@ class ManufacturerExtractor(BaseExtractor):
             if candidate_scores[best_code] >= 1:
                 return best_code
 
-        return None  # liever geen gok dan fout
+        # 3) Uiteindelijk: liever geen gok dan een foute waarde
+        return None
 
     # ------------------------------------------------------------------
-    # 3) Notes / beschrijving (met AI + fallback)
+    # 3) Notes / beschrijving
     # ------------------------------------------------------------------
-    def _extract_notes_with_ai(self, soup: BeautifulSoup, text: str) -> str | None:
+    def _extract_notes(self, soup: BeautifulSoup, text: str) -> str | None:
         """
-        Maak een korte beschrijving voor 'notes':
-        1. Bepaal eerst een basistekst over het bedrijf (about-sectie/meta/paragrafen).
-        2. Probeer deze te laten samenvatten door de LLM (als beschikbaar).
-        3. Als AI niet beschikbaar of faalt -> gebruik basistekst zelf (afgekapt).
-        """
+        Maak een korte beschrijving van het bedrijf.
 
-        # 1) Basistekst zoeken (heuristiek)
-        base_text = self._build_base_notes_text(soup, text)
-        if not base_text:
-            return None
-
-        # 2) AI-samenvatting proberen
-        ai_summary = summarize_company_text(base_text, language="en", max_chars=800)
-        if ai_summary:
-            return ai_summary
-
-        # 3) Fallback: basistekst zelf (iets ingekort)
-        return base_text[:800].strip()
-
-    def _build_base_notes_text(self, soup: BeautifulSoup, text: str) -> str | None:
-        """
-        Heuristiek om een geschikte basistekst voor samenvatting te vinden:
-        1. About-/Over-ons sectie
+        Voorkeur:
+        1. Tekst direct onder een 'About'/bedrijfsheadings
         2. meta description
-        3. Eerste 1–3 paragrafen
+        3. Eerste 1-3 zinnige paragrafen
         """
 
+        # 1) Probeer een "About"/"Over ons" sectie te vinden
         about_text = self._extract_about_section(soup)
         if about_text:
-            return about_text
+            return about_text[:800]  # limiteren
 
+        # 2) meta description
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
             desc = meta_desc["content"].strip()
             if desc:
-                return desc
+                return desc[:800]
 
+        # 3) eerste 1-3 paragrafen
         paragraphs = [
             p.get_text(separator=" ", strip=True)
             for p in soup.find_all("p")
@@ -253,7 +244,7 @@ class ManufacturerExtractor(BaseExtractor):
                 break
 
         if joined:
-            return joined
+            return joined[:800]
 
         return None
 
@@ -275,13 +266,16 @@ class ManufacturerExtractor(BaseExtractor):
             "company profile",
         ]
 
+        # Zoek h1–h3 headings
         for level in ["h1", "h2", "h3"]:
             for heading in soup.find_all(level):
                 heading_text = heading.get_text(separator=" ", strip=True).lower()
                 if any(k in heading_text for k in about_keywords):
+                    # verzamel de volgende siblings/paragrafen
                     paragraphs: List[str] = []
                     current: Tag | None = heading
 
+                    # loop door volgende siblings, maar niet eindeloos
                     for _ in range(10):
                         if current is None:
                             break
@@ -292,6 +286,7 @@ class ManufacturerExtractor(BaseExtractor):
                             txt = current.get_text(separator=" ", strip=True)
                             if txt:
                                 paragraphs.append(txt)
+                        # stoppen als we een nieuwe heading tegenkomen
                         if current.name in ["h1", "h2", "h3"]:
                             break
 
