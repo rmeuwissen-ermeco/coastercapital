@@ -2,16 +2,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .db import Base, engine
-from .routers import manufacturers, parks, coasters, suggestions, debug
+from . import models
+from .routers import manufacturers, parks, coasters, suggestions, debug, extract
 
-# Tabellen aanmaken (SQLite)
+# Tabellen aanmaken (SQLite) – nu mét alle modellen geladen
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="CoasterCapital API",
     version="0.1.0",
-    description="Backend voor CoasterCapital – stap 1: manufacturers beheer.",
+    description="Backend voor CoasterCapital – stap 1: manufacturers/parks/coasters + AI-suggesties.",
 )
+
 
 origins = [
     "http://localhost:3000",
@@ -42,3 +44,4 @@ app.include_router(parks.router)
 app.include_router(coasters.router)
 app.include_router(suggestions.router)
 app.include_router(debug.router)
+app.include_router(extract.router)

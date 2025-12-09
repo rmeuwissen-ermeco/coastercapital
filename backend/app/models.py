@@ -92,3 +92,16 @@ class DataSuggestion(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     reviewed_at = Column(DateTime(timezone=True), nullable=True)
+
+class SourcePage(Base):
+    __tablename__ = "source_pages"
+
+    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+    entity_type = Column(String, nullable=False)  # manufacturer / park / coaster
+    entity_id = Column(String, nullable=True)     # mag null zijn bij nieuwe suggestions
+    url = Column(String, nullable=False)
+
+    status_code = Column(String, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now())
+    raw_html = Column(String, nullable=True)
+    clean_text = Column(String, nullable=True)

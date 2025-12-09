@@ -155,3 +155,20 @@ class DataSuggestionReview(BaseModel):
 
     action: Literal["accept", "reject"]
     review_note: Optional[str] = None
+
+
+# ---------- Source Page Read ----------
+
+
+class SourcePageRead(BaseModel):
+    id: str
+    entity_type: str
+    entity_id: str | None
+    url: str
+    status_code: str | None
+    raw_html: str | None
+    clean_text: str | None
+    fetched_at: datetime
+
+    class Config:
+        from_attributes = True
