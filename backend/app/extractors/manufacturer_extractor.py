@@ -1,3 +1,4 @@
+import logging
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -11,6 +12,12 @@ from ..ai.client import (
 )
 from ..routers.utils import create_suggestion_diff
 from ..sources.wikipedia import find_best_wikipedia_page
+from ..sources.wikidata import (
+    find_wikidata_for_name,
+    parse_wikidata_manufacturer_entity,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _split_into_sentences(text: str) -> list[str]:
@@ -61,8 +68,7 @@ def _select_relevant_sentences(
     return " ".join(selected)
 
 
-# Heel simpele country-name → ISO2 mapping voor de meest relevante landen.
-# Dit voorkomt dat we meteen weer een aparte AI-call moeten doen.
+# Heel simpele country-name → ISO2 mapping voor fallback op basis van AI-facts
 _COUNTRY_NAME_TO_ISO = {
     "netherlands": "NL",
     "the netherlands": "NL",
@@ -112,15 +118,22 @@ def _normalize_country_to_iso2(raw: str | None) -> str | None:
 class ManufacturerExtractor:
     """
     Extractor voor manufacturers:
+    - Wikidata als primaire bron
+    - Wikipedia als tweede bron
+    - Officiële website als derde bron
+    - Heuristiek (title/meta) als uiterste fallback voor naam/notes
+
+    Flow:
     - HTML ophalen via manufacturer.website_url
     - SourcePage aanmaken voor de officiële site
+    - Wikidata ophalen voor structured data (naam, land, opening, website)
     - AI-call 1: kernfeiten uit de officiële site (naam, land, ride_types, coasters, ...)
     - Wikipedia ophalen en filteren op kernwoorden/coasternamen
-    - AI-call 2: multi-source samenvatting met focus op rollen in de coasterwereld (notes)
+    - AI-call 2: multi-source samenvatting met focus op rol in coasterwereld (notes)
     - Gestructureerde correcties voorstellen voor:
         - name
         - country_code
-      (later uit te breiden met extra velden als die in het model komen)
+        - website_url
     - create_suggestion_diff zorgt dat alleen echte wijzigingen in DataSuggestion komen
     """
 
@@ -142,7 +155,8 @@ class ManufacturerExtractor:
     ) -> models.SourcePage:
         """
         Slaat de bronpagina op in SourcePage en geeft het record terug.
-        Voor manufacturers loggen we alleen de officiële site + Wikipedia.
+        We loggen in ieder geval de officiële site; Wikipedia/Wikidata kunnen later
+        ook worden toegevoegd als extra transparantie.
         """
         source_page = models.SourcePage(
             entity_type="manufacturer",
@@ -160,7 +174,7 @@ class ManufacturerExtractor:
     def _heuristic_name_from_title(self, soup: BeautifulSoup) -> str | None:
         """
         Eenvoudige poging om een betere naam uit <title> te halen.
-        Wordt alleen gebruikt als AI of Wikipedia geen nettere naam geven.
+        Wordt alleen gebruikt als AI/Wikidata/Wikipedia geen nettere naam geven.
         """
         title_tag = soup.find("title")
         if not title_tag:
@@ -169,6 +183,27 @@ class ManufacturerExtractor:
         if not title_text or title_text == self.manufacturer.name:
             return None
         return title_text
+
+    def _heuristic_notes(self, soup: BeautifulSoup) -> str | None:
+        """
+        Heuristische beschrijving op basis van meta description of og:description.
+        Alleen als AI niets bruikbaars oplevert.
+        """
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        if not meta_desc:
+            meta_desc = soup.find("meta", attrs={"property": "og:description"})
+
+        if not meta_desc:
+            return None
+
+        text = (meta_desc.get("content") or "").strip()
+        if not text:
+            return None
+
+        if text == (self.manufacturer.notes or ""):
+            return None
+
+        return text
 
     def _extract_keywords_from_official(self, text: str) -> dict:
         """
@@ -204,6 +239,7 @@ class ManufacturerExtractor:
 
     def _get_wikipedia_snippet(
         self,
+        search_name: str,
         keywords: list[str],
         coaster_names: list[str],
     ) -> SourceSnippet | None:
@@ -211,8 +247,7 @@ class ManufacturerExtractor:
         Haalt Wikipedia-extract op, filtert zinnen op kernwoorden/coasternamen
         en slaat de bron op als SourcePage.
         """
-        # We zoeken op de huidige naam; als AI een betere naam vindt, kan dat later nog aangepast worden
-        page = find_best_wikipedia_page(self.manufacturer.name)
+        page = find_best_wikipedia_page(search_name)
         if not page or not page.extract:
             return None
 
@@ -237,6 +272,59 @@ class ManufacturerExtractor:
             url=page.url,
         )
 
+    def _get_wikidata_structured_and_snippet(self) -> tuple[dict, SourceSnippet | None]:
+        """
+        Haalt Wikidata-info op voor deze manufacturer en bouwt een klein
+        tekst-snippet voor gebruik in de multi-source samenvatting.
+        """
+        structured: dict = {}
+        snippet: SourceSnippet | None = None
+
+        name = self.manufacturer.name or ""
+        if not name.strip():
+            return structured, None
+
+        try:
+            entity = find_wikidata_for_name(name)
+        except Exception as e:
+            logger.error(
+                "[ManufacturerExtractor] Wikidata lookup failed for %r: %s",
+                name,
+                e,
+            )
+            return structured, None
+
+        if not entity:
+            return structured, None
+
+        structured = parse_wikidata_manufacturer_entity(entity) or {}
+        lines: list[str] = []
+
+        if structured.get("name"):
+            lines.append(f"Name: {structured['name']}")
+        if structured.get("country_code"):
+            lines.append(f"Country code: {structured['country_code']}")
+        if structured.get("opening_year"):
+            y = structured["opening_year"]
+            m = structured.get("opening_month")
+            d = structured.get("opening_day")
+            if m and d:
+                lines.append(f"Founded/opening: {y:04d}-{m:02d}-{d:02d}")
+            else:
+                lines.append(f"Founded/opening year: {y}")
+        if structured.get("website_url"):
+            lines.append(f"Official website (Wikidata): {structured['website_url']}")
+
+        text = "\n".join(lines).strip()
+        if text:
+            snippet = SourceSnippet(
+                label="Wikidata",
+                text=text,
+                url=None,  # we kennen het exacte entity-URL hier niet, alleen de data
+            )
+
+        return structured, snippet
+
     def _extract_notes_with_ai(self, snippets: list[SourceSnippet]) -> str | None:
         """
         AI-call 2: multi-source samenvatting over de manufacturer met focus op
@@ -245,7 +333,6 @@ class ManufacturerExtractor:
         if not snippets:
             return None
 
-        # Bepaal een nette naam om in de prompt te gebruiken
         base_name = self.manufacturer.name or "Unknown manufacturer"
 
         try:
@@ -256,7 +343,11 @@ class ManufacturerExtractor:
                 language="en",
                 max_chars=800,
             )
-        except Exception:
+        except Exception as e:
+            logger.error(
+                "[ManufacturerExtractor] Error in summarize_entity_from_sources: %s",
+                e,
+            )
             return None
 
         if not ai_summary:
@@ -299,42 +390,50 @@ class ManufacturerExtractor:
         }
         updated_data = dict(current_data)
 
-        # 4a. AI-call 1: kernfeiten uit de officiële site
+        # 4a. Wikidata structured info + snippet
+        wikidata_structured, wikidata_snippet = self._get_wikidata_structured_and_snippet()
+
+        # 4b. AI-call 1: kernfeiten uit de officiële site
         facts = self._extract_keywords_from_official(clean_text)
         keywords = facts.get("keywords", []) or []
         notable_coasters = facts.get("notable_coasters", []) or []
 
-        # Voeg de huidige naam toe als keyword
+        # Voeg de huidige naam én Wikidata-naam toe als keyword
         if self.manufacturer.name:
             keywords.append(self.manufacturer.name)
+        if wikidata_structured.get("name"):
+            keywords.append(wikidata_structured["name"])
 
-        # 4b. Feitenblok als extra bron
+        # Feitenblok als extra bron
         facts_lines: list[str] = []
         if facts.get("name"):
-            facts_lines.append(f"Name: {facts['name']}")
+            facts_lines.append(f"Name (from website text): {facts['name']}")
         if facts.get("location_country"):
-            facts_lines.append(f"Country: {facts['location_country']}")
+            facts_lines.append(f"Country (from website text): {facts['location_country']}")
         if facts.get("opening_year"):
-            facts_lines.append(f"Founded/opening year: {facts['opening_year']}")
+            facts_lines.append(f"Founded/opening year (from website text): {facts['opening_year']}")
         if facts.get("ride_types"):
             facts_lines.append(
                 "Ride types: " + ", ".join(facts["ride_types"][:20])
             )
         if notable_coasters:
             facts_lines.append(
-                "Notable coasters: " + ", ".join(notable_coasters[:25])
+                "Notable coasters (from website text): "
+                + ", ".join(notable_coasters[:25])
             )
 
         facts_text = "\n".join(facts_lines).strip() if facts_lines else ""
 
-        # 4c. Bron-snippets opbouwen: official + facts + Wikipedia
+        # 4c. Bron-snippets opbouwen in volgorde:
+        # Wikidata -> Official site -> Facts -> Wikipedia
         snippets: list[SourceSnippet] = []
 
-        # Officiële website
+        if wikidata_snippet:
+            snippets.append(wikidata_snippet)
+
         official_snippet = self._get_official_snippet(clean_text, url)
         snippets.append(official_snippet)
 
-        # Feiten uit AI-call 1
         if facts_text:
             facts_snippet = SourceSnippet(
                 label="Extracted facts from official website (AI)",
@@ -343,33 +442,55 @@ class ManufacturerExtractor:
             )
             snippets.append(facts_snippet)
 
-        # Wikipedia (optioneel)
-        wiki_snippet = self._get_wikipedia_snippet(
-            keywords=keywords,
-            coaster_names=notable_coasters,
-        )
-        if wiki_snippet:
-            snippets.append(wiki_snippet)
+        # Wikipedia (optioneel) – we zoeken met Wikidata-naam als die bestaat, anders huidige naam
+        search_name = wikidata_structured.get("name") or self.manufacturer.name or ""
+        if search_name.strip():
+            wiki_snippet = self._get_wikipedia_snippet(
+                search_name=search_name,
+                keywords=keywords,
+                coaster_names=notable_coasters,
+            )
+            if wiki_snippet:
+                snippets.append(wiki_snippet)
 
         # 4d. AI-samenvatting (notes) over alle bronnen
         ai_notes = self._extract_notes_with_ai(snippets)
         if ai_notes:
             updated_data["notes"] = ai_notes
+        else:
+            # fallback: heuristiek
+            heuristic_notes = self._heuristic_notes(soup)
+            if heuristic_notes:
+                updated_data["notes"] = heuristic_notes
 
-        # 4e. Gestructureerde correcties op basis van AI-facts
-        # Naam: gebruik AI-naam als die netter/canonischer is
-        name_new = facts.get("name")
-        if name_new and name_new != self.manufacturer.name:
-            updated_data["name"] = name_new
+        # 4e. Gestructureerde correcties
 
-        # Landcode: uit location_country proberen een ISO2 te halen
-        country_raw = facts.get("location_country")
-        country_code_new = _normalize_country_to_iso2(country_raw)
+        # Naam: voorkeur voor Wikidata-naam, anders AI-facts-naam
+        canon_name = (
+            wikidata_structured.get("name")
+            or facts.get("name")
+        )
+        if canon_name and canon_name != self.manufacturer.name:
+            updated_data["name"] = canon_name
+
+        # Landcode: eerst Wikidata, dan fallback via AI-facts
+        country_code_new = wikidata_structured.get("country_code")
+        if not country_code_new and facts.get("location_country"):
+            country_code_new = _normalize_country_to_iso2(facts.get("location_country"))
+
         if country_code_new and country_code_new != self.manufacturer.country_code:
             updated_data["country_code"] = country_code_new
 
-        # Voor nu laten we website_url ongemoeid; die komt uit je eigen invoer.
-        # Later kunnen we, als we Wikipedia/Wikidata erbij nemen, een extra check toevoegen.
+        # Website: als Wikidata een andere (of ontbrekende) website heeft, voorstel maken
+        website_new = wikidata_structured.get("website_url")
+        if website_new and website_new != self.manufacturer.website_url:
+            updated_data["website_url"] = website_new
+
+        # 4f. Als alles faalt, kunnen we nog een heuristische naam uit <title> proberen
+        if updated_data.get("name") == current_data.get("name"):
+            new_name_from_title = self._heuristic_name_from_title(soup)
+            if new_name_from_title and new_name_from_title != self.manufacturer.name:
+                updated_data["name"] = new_name_from_title
 
         # 5. Diff bepalen – alleen velden die echt veranderen
         diff = create_suggestion_diff(current_data, updated_data)
@@ -394,7 +515,7 @@ class ManufacturerExtractor:
         self.db.refresh(suggestion)
 
         return {
-            "message": "Extractie voor manufacturer voltooid (AI multi-source + heuristiek).",
+            "message": "Extractie voor manufacturer voltooid (Wikidata + Wikipedia + official + heuristiek).",
             "suggestion_id": suggestion.id,
             "source_page_id": source_page.id,
             "suggested_data": diff,
