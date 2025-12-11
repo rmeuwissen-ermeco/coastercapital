@@ -1,303 +1,401 @@
-from __future__ import annotations
+import re
+import requests
+from bs4 import BeautifulSoup
+from sqlalchemy.orm import Session
 
-from typing import Dict, Any, List
+from .. import models
+from ..ai.client import (
+    SourceSnippet,
+    summarize_entity_from_sources,
+    extract_manufacturer_facts_from_text,
+)
+from ..routers.utils import create_suggestion_diff
+from ..sources.wikipedia import find_best_wikipedia_page
 
-from bs4 import BeautifulSoup, Tag
 
-from .base_extractor import BaseExtractor
-from ..ai.client import summarize_company_text
-
-
-class ManufacturerExtractor(BaseExtractor):
+def _split_into_sentences(text: str) -> list[str]:
     """
-    Extractor voor manufacturers.
-
-    Doel:
-    - Officiële naam zo goed mogelijk vinden (schema.org, og:site_name, og:title, title)
-    - Land-code voorzichtig afleiden uit adres/headquarters informatie
-    - Korte beschrijving voor 'notes' maken:
-      * eerst via LLM als OPENAI_API_KEY beschikbaar is
-      * anders via heuristiek op HTML
+    Simpele zins-splitter op basis van ., ! en ?.
+    Niet perfect, maar goed genoeg voor filtering.
     """
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return [p.strip() for p in parts if p.strip()]
 
-    def extract(self, soup: BeautifulSoup, text: str) -> Dict[str, Any]:
-        suggested: Dict[str, Any] = {}
 
-        name = self._extract_name(soup)
-        if name:
-            suggested["name"] = name
+def _select_relevant_sentences(
+    text: str,
+    keywords: list[str],
+    coaster_names: list[str],
+    max_sentences: int = 60,
+) -> str:
+    """
+    Selecteert zinnen uit 'text' die één van de keywords of coaster-namen bevatten.
+    Als er niets matcht, wordt een fallback gemaakt: de eerste N zinnen.
+    """
+    if not text:
+        return ""
 
-        country_code = self._extract_country_code(soup, text)
-        if country_code:
-            suggested["country_code"] = country_code
+    sentences = _split_into_sentences(text)
+    if not sentences:
+        return ""
 
-        notes = self._extract_notes_with_ai(soup, text)
-        if notes:
-            suggested["notes"] = notes
+    kw_lower = {k.lower() for k in keywords if isinstance(k, str)}
+    coaster_lower = {c.lower() for c in coaster_names if isinstance(c, str)}
 
-        return suggested
+    selected: list[str] = []
 
-    # ------------------------------------------------------------------
-    # 1) Naam
-    # ------------------------------------------------------------------
-    def _extract_name(self, soup: BeautifulSoup) -> str | None:
-        """
-        Probeer de officiële bedrijfsnaam te vinden met een aantal strategieën:
-        1. schema.org Organization → itemprop="name"
-        2. og:site_name
-        3. og:title
-        4. <title> met simpele opschoning
-        """
+    for s in sentences:
+        s_lower = s.lower()
+        if any(k in s_lower for k in kw_lower) or any(
+            c in s_lower for c in coaster_lower
+        ):
+            selected.append(s)
+        if len(selected) >= max_sentences:
+            break
 
-        # 1) schema.org Organization
-        org_blocks: List[Tag] = soup.find_all(
-            attrs={"itemtype": lambda v: v and "Organization" in v}
-        )
-        for org in org_blocks:
-            name_tag = org.find(attrs={"itemprop": "name"})
-            if name_tag and name_tag.get_text(strip=True):
-                return name_tag.get_text(strip=True)
+    if not selected:
+        selected = sentences[:max_sentences]
 
-        # 2) og:site_name
-        og_site_name = soup.find("meta", attrs={"property": "og:site_name"})
-        if og_site_name and og_site_name.get("content"):
-            name = og_site_name["content"].strip()
-            if name:
-                return name
+    return " ".join(selected)
 
-        # 3) og:title
-        og_title = soup.find("meta", attrs={"property": "og:title"})
-        if og_title and og_title.get("content"):
-            raw = og_title["content"].strip()
-            cleaned = self._cleanup_title(raw)
-            if cleaned:
-                return cleaned
 
-        # 4) fallback: <title>
-        title_tag = soup.find("title")
-        if title_tag:
-            raw_title = title_tag.get_text().strip()
-            cleaned = self._cleanup_title(raw_title)
-            if cleaned:
-                return cleaned
+# Heel simpele country-name → ISO2 mapping voor de meest relevante landen.
+# Dit voorkomt dat we meteen weer een aparte AI-call moeten doen.
+_COUNTRY_NAME_TO_ISO = {
+    "netherlands": "NL",
+    "the netherlands": "NL",
+    "kingdom of the netherlands": "NL",
+    "germany": "DE",
+    "federal republic of germany": "DE",
+    "switzerland": "CH",
+    "swiss": "CH",
+    "poland": "PL",
+    "france": "FR",
+    "spain": "ES",
+    "italy": "IT",
+    "belgium": "BE",
+    "united kingdom": "GB",
+    "great britain": "GB",
+    "england": "GB",
+    "united states": "US",
+    "united states of america": "US",
+    "usa": "US",
+    "canada": "CA",
+    "china": "CN",
+    "japan": "JP",
+}
 
+
+def _normalize_country_to_iso2(raw: str | None) -> str | None:
+    """
+    Probeert een landnaam of code om te zetten naar een ISO2 country_code.
+    - Als het al 'NL', 'DE', ... is -> uppercased teruggeven.
+    - Als het een naam is -> simpele mapping op basis van _COUNTRY_NAME_TO_ISO.
+    """
+    if not raw:
         return None
 
-    def _cleanup_title(self, raw_title: str) -> str:
-        """
-        Titel opschonen door simpele scheidingstekens weg te knippen.
-        Voorbeeld:
-        - "Vekoma Rides – Official Website" -> "Vekoma Rides"
-        - "Vekoma | Coasters & Rides" -> "Vekoma"
-        """
+    value = raw.strip()
+    if not value:
+        return None
 
-        parts = (
-            raw_title.split(" | ")[0]
-            .split(" – ")[0]
-            .split(" - ")[0]
-            .strip()
+    # Als het al een 2-letterig ding is
+    if len(value) == 2 and value.isalpha():
+        return value.upper()
+
+    key = value.lower()
+    return _COUNTRY_NAME_TO_ISO.get(key)
+
+
+class ManufacturerExtractor:
+    """
+    Extractor voor manufacturers:
+    - HTML ophalen via manufacturer.website_url
+    - SourcePage aanmaken voor de officiële site
+    - AI-call 1: kernfeiten uit de officiële site (naam, land, ride_types, coasters, ...)
+    - Wikipedia ophalen en filteren op kernwoorden/coasternamen
+    - AI-call 2: multi-source samenvatting met focus op rollen in de coasterwereld (notes)
+    - Gestructureerde correcties voorstellen voor:
+        - name
+        - country_code
+      (later uit te breiden met extra velden als die in het model komen)
+    - create_suggestion_diff zorgt dat alleen echte wijzigingen in DataSuggestion komen
+    """
+
+    def __init__(self, db: Session, manufacturer: models.Manufacturer):
+        self.db = db
+        self.manufacturer = manufacturer
+
+    def _fetch_html(self, url: str) -> tuple[str, str]:
+        """HTML ophalen, geeft (status_code, raw_html) terug."""
+        resp = requests.get(url, timeout=10)
+        return str(resp.status_code), resp.text
+
+    def _store_source_page(
+        self,
+        url: str,
+        status_code: str,
+        raw_html: str,
+        clean_text: str,
+    ) -> models.SourcePage:
+        """
+        Slaat de bronpagina op in SourcePage en geeft het record terug.
+        Voor manufacturers loggen we alleen de officiële site + Wikipedia.
+        """
+        source_page = models.SourcePage(
+            entity_type="manufacturer",
+            entity_id=self.manufacturer.id,
+            url=url,
+            status_code=status_code,
+            raw_html=raw_html[:10000],
+            clean_text=clean_text[:10000],
         )
-        return parts or raw_title.strip()
+        self.db.add(source_page)
+        self.db.commit()
+        self.db.refresh(source_page)
+        return source_page
 
-    # ------------------------------------------------------------------
-    # 2) Land-code
-    # ------------------------------------------------------------------
-    def _extract_country_code(self, soup: BeautifulSoup, text: str) -> str | None:
+    def _heuristic_name_from_title(self, soup: BeautifulSoup) -> str | None:
         """
-        Probeer voorzichtig een land-code te bepalen.
-
-        Strategie:
-        - Eerst kijken naar regels waarin woorden als 'headquarters', 'based in',
-          'located in' voorkomen, en daarbinnen naar landnamen zoeken.
-        - Daarna naar adressen/contactblokken in HTML.
-        - Beter geen land invullen dan een verkeerde land-code.
+        Eenvoudige poging om een betere naam uit <title> te halen.
+        Wordt alleen gebruikt als AI of Wikipedia geen nettere naam geven.
         """
+        title_tag = soup.find("title")
+        if not title_tag:
+            return None
+        title_text = title_tag.get_text().strip()
+        if not title_text or title_text == self.manufacturer.name:
+            return None
+        return title_text
 
-        country_map = {
-            "netherlands": "NL",
-            "nederland": "NL",
-            "germany": "DE",
-            "deutschland": "DE",
-            "belgium": "BE",
-            "belgië": "BE",
-            "belgie": "BE",
-            "france": "FR",
-            "frankrijk": "FR",
-            "united kingdom": "GB",
-            "great britain": "GB",
-            "england": "GB",
-            "united states": "US",
-            "usa": "US",
-            "u.s.a": "US",
-            "u.s.a.": "US",
-            "italy": "IT",
-            "italië": "IT",
-            "italie": "IT",
-            "spain": "ES",
-            "españa": "ES",
-            "spanje": "ES",
+    def _extract_keywords_from_official(self, text: str) -> dict:
+        """
+        AI-call 1: haal kernfeiten, kernwoorden, ride_types en coasternamen uit de officiële site.
+        Bij fout of ontbrekende info krijg je een lege dict.
+        """
+        facts = extract_manufacturer_facts_from_text(text, language="en") or {}
+        return {
+            "name": facts.get("name"),
+            "location_country": facts.get("location_country"),
+            "opening_year": facts.get("opening_year"),
+            "keywords": facts.get("keywords") or [],
+            "ride_types": facts.get("ride_types") or [],
+            "notable_coasters": facts.get("notable_coasters") or [],
+            "notable_parks": facts.get("notable_parks") or [],
         }
 
-        lower_text = text.lower()
-        lines = [line.strip() for line in lower_text.splitlines() if line.strip()]
+    def _get_official_snippet(
+        self,
+        clean_text: str,
+        url: str,
+        max_chars: int = 8000,
+    ) -> SourceSnippet:
+        """Maak een SourceSnippet voor de officiële website (ruime tekst, maar afgekapt)."""
+        text = clean_text.strip()
+        if len(text) > max_chars:
+            text = text[:max_chars].rstrip()
+        return SourceSnippet(
+            label="Official website",
+            text=text,
+            url=url,
+        )
 
-        hq_keywords = [
-            "headquarters",
-            "head office",
-            "based in",
-            "located in",
-            "registered office",
-            "office in",
-            "headquarter",
-        ]
-
-        candidate_scores: Dict[str, int] = {}
-
-        # 1) Eerst regels met hq-keywords
-        for line in lines:
-            if any(k in line for k in hq_keywords):
-                for phrase, code in country_map.items():
-                    if phrase in line:
-                        candidate_scores[code] = candidate_scores.get(code, 0) + 2
-
-        if candidate_scores:
-            best_code = max(candidate_scores, key=candidate_scores.get)
-            if candidate_scores[best_code] >= 2:
-                return best_code
-
-        # 2) Fallback: adressen/contactblokken in HTML
-        address_candidates: List[str] = []
-
-        for addr in soup.find_all("address"):
-            address_candidates.append(addr.get_text(separator=" ", strip=True))
-
-        for el in soup.find_all(True, attrs={"id": True}):
-            if "contact" in el["id"].lower():
-                address_candidates.append(el.get_text(separator=" ", strip=True))
-
-        for el in soup.find_all(True, attrs={"class": True}):
-            classes = " ".join(el.get("class", [])).lower()
-            if "contact" in classes or "address" in classes:
-                address_candidates.append(
-                    el.get_text(separator=" ", strip=True)
-                )
-
-        candidate_scores = {}
-        for block in address_candidates:
-            block_lower = block.lower()
-            for phrase, code in country_map.items():
-                if phrase in block_lower:
-                    candidate_scores[code] = candidate_scores.get(code, 0) + 1
-
-        if candidate_scores:
-            best_code = max(candidate_scores, key=candidate_scores.get)
-            if candidate_scores[best_code] >= 1:
-                return best_code
-
-        return None  # liever geen gok dan fout
-
-    # ------------------------------------------------------------------
-    # 3) Notes / beschrijving (met AI + fallback)
-    # ------------------------------------------------------------------
-    def _extract_notes_with_ai(self, soup: BeautifulSoup, text: str) -> str | None:
+    def _get_wikipedia_snippet(
+        self,
+        keywords: list[str],
+        coaster_names: list[str],
+    ) -> SourceSnippet | None:
         """
-        Maak een korte beschrijving voor 'notes':
-        1. Bepaal eerst een basistekst over het bedrijf (about-sectie/meta/paragrafen).
-        2. Probeer deze te laten samenvatten door de LLM (als beschikbaar).
-        3. Als AI niet beschikbaar of faalt -> gebruik basistekst zelf (afgekapt).
+        Haalt Wikipedia-extract op, filtert zinnen op kernwoorden/coasternamen
+        en slaat de bron op als SourcePage.
         """
-
-        # 1) Basistekst zoeken (heuristiek)
-        base_text = self._build_base_notes_text(soup, text)
-        if not base_text:
+        # We zoeken op de huidige naam; als AI een betere naam vindt, kan dat later nog aangepast worden
+        page = find_best_wikipedia_page(self.manufacturer.name)
+        if not page or not page.extract:
             return None
 
-        # 2) AI-samenvatting proberen
-        ai_summary = summarize_company_text(base_text, language="en", max_chars=800)
-        if ai_summary:
-            return ai_summary
+        filtered_text = _select_relevant_sentences(
+            page.extract,
+            keywords=keywords,
+            coaster_names=coaster_names,
+            max_sentences=80,
+        )
 
-        # 3) Fallback: basistekst zelf (iets ingekort)
-        return base_text[:800].strip()
+        # Volledige extract in raw_html, gefilterde tekst in clean_text
+        self._store_source_page(
+            url=page.url,
+            status_code="200",
+            raw_html=page.extract,
+            clean_text=filtered_text,
+        )
 
-    def _build_base_notes_text(self, soup: BeautifulSoup, text: str) -> str | None:
+        return SourceSnippet(
+            label=f"Wikipedia ({page.lang})",
+            text=filtered_text,
+            url=page.url,
+        )
+
+    def _extract_notes_with_ai(self, snippets: list[SourceSnippet]) -> str | None:
         """
-        Heuristiek om een geschikte basistekst voor samenvatting te vinden:
-        1. About-/Over-ons sectie
-        2. meta description
-        3. Eerste 1–3 paragrafen
+        AI-call 2: multi-source samenvatting over de manufacturer met focus op
+        producten, ride_types en rol in de coasterwereld.
+        """
+        if not snippets:
+            return None
+
+        # Bepaal een nette naam om in de prompt te gebruiken
+        base_name = self.manufacturer.name or "Unknown manufacturer"
+
+        try:
+            ai_summary = summarize_entity_from_sources(
+                name=base_name,
+                entity_type="manufacturer",
+                sources=snippets,
+                language="en",
+                max_chars=800,
+            )
+        except Exception:
+            return None
+
+        if not ai_summary:
+            return None
+
+        return str(ai_summary).strip() or None
+
+    def run(self) -> dict:
+        """
+        Voert de volledige extractie uit en maakt eventueel een DataSuggestion aan.
+        Geeft een klein resultaat-dict terug.
         """
 
-        about_text = self._extract_about_section(soup)
-        if about_text:
-            return about_text
+        if not self.manufacturer.website_url:
+            raise ValueError("Geen website_url bekend voor deze manufacturer.")
 
-        meta_desc = soup.find("meta", attrs={"name": "description"})
-        if meta_desc and meta_desc.get("content"):
-            desc = meta_desc["content"].strip()
-            if desc:
-                return desc
+        url = self.manufacturer.website_url
 
-        paragraphs = [
-            p.get_text(separator=" ", strip=True)
-            for p in soup.find_all("p")
-            if p.get_text(strip=True)
-        ]
+        # 1. HTML ophalen van de officiële site
+        status_code, raw_html = self._fetch_html(url)
 
-        joined = ""
-        for p in paragraphs:
-            if len(joined) > 0:
-                joined += " "
-            joined += p
-            if len(joined) >= 400:
-                break
+        # 2. Soup + plain text
+        soup = BeautifulSoup(raw_html, "html.parser")
+        clean_text = soup.get_text(separator="\n").strip()
 
-        if joined:
-            return joined
+        # 3. SourcePage loggen voor de officiële site
+        source_page = self._store_source_page(
+            url=url,
+            status_code=status_code,
+            raw_html=raw_html,
+            clean_text=clean_text,
+        )
 
-        return None
+        # 4. Candidate updates voorbereiden
+        current_data = {
+            "name": self.manufacturer.name,
+            "country_code": self.manufacturer.country_code,
+            "website_url": self.manufacturer.website_url,
+            "notes": self.manufacturer.notes,
+        }
+        updated_data = dict(current_data)
 
-    def _extract_about_section(self, soup: BeautifulSoup) -> str | None:
-        """
-        Zoekt naar headings zoals 'About', 'About us', 'Over ons', 'Über uns', 'The company'
-        en pakt 1–3 paragrafen erna.
-        """
+        # 4a. AI-call 1: kernfeiten uit de officiële site
+        facts = self._extract_keywords_from_official(clean_text)
+        keywords = facts.get("keywords", []) or []
+        notable_coasters = facts.get("notable_coasters", []) or []
 
-        about_keywords = [
-            "about",
-            "about us",
-            "about us.",
-            "about the company",
-            "the company",
-            "over ons",
-            "über uns",
-            "über uns.",
-            "company profile",
-        ]
+        # Voeg de huidige naam toe als keyword
+        if self.manufacturer.name:
+            keywords.append(self.manufacturer.name)
 
-        for level in ["h1", "h2", "h3"]:
-            for heading in soup.find_all(level):
-                heading_text = heading.get_text(separator=" ", strip=True).lower()
-                if any(k in heading_text for k in about_keywords):
-                    paragraphs: List[str] = []
-                    current: Tag | None = heading
+        # 4b. Feitenblok als extra bron
+        facts_lines: list[str] = []
+        if facts.get("name"):
+            facts_lines.append(f"Name: {facts['name']}")
+        if facts.get("location_country"):
+            facts_lines.append(f"Country: {facts['location_country']}")
+        if facts.get("opening_year"):
+            facts_lines.append(f"Founded/opening year: {facts['opening_year']}")
+        if facts.get("ride_types"):
+            facts_lines.append(
+                "Ride types: " + ", ".join(facts["ride_types"][:20])
+            )
+        if notable_coasters:
+            facts_lines.append(
+                "Notable coasters: " + ", ".join(notable_coasters[:25])
+            )
 
-                    for _ in range(10):
-                        if current is None:
-                            break
-                        current = current.find_next_sibling()
-                        if current is None:
-                            break
-                        if current.name == "p":
-                            txt = current.get_text(separator=" ", strip=True)
-                            if txt:
-                                paragraphs.append(txt)
-                        if current.name in ["h1", "h2", "h3"]:
-                            break
+        facts_text = "\n".join(facts_lines).strip() if facts_lines else ""
 
-                    if paragraphs:
-                        combined = " ".join(paragraphs)
-                        if combined:
-                            return combined
+        # 4c. Bron-snippets opbouwen: official + facts + Wikipedia
+        snippets: list[SourceSnippet] = []
 
-        return None
+        # Officiële website
+        official_snippet = self._get_official_snippet(clean_text, url)
+        snippets.append(official_snippet)
+
+        # Feiten uit AI-call 1
+        if facts_text:
+            facts_snippet = SourceSnippet(
+                label="Extracted facts from official website (AI)",
+                text=facts_text,
+                url=None,
+            )
+            snippets.append(facts_snippet)
+
+        # Wikipedia (optioneel)
+        wiki_snippet = self._get_wikipedia_snippet(
+            keywords=keywords,
+            coaster_names=notable_coasters,
+        )
+        if wiki_snippet:
+            snippets.append(wiki_snippet)
+
+        # 4d. AI-samenvatting (notes) over alle bronnen
+        ai_notes = self._extract_notes_with_ai(snippets)
+        if ai_notes:
+            updated_data["notes"] = ai_notes
+
+        # 4e. Gestructureerde correcties op basis van AI-facts
+        # Naam: gebruik AI-naam als die netter/canonischer is
+        name_new = facts.get("name")
+        if name_new and name_new != self.manufacturer.name:
+            updated_data["name"] = name_new
+
+        # Landcode: uit location_country proberen een ISO2 te halen
+        country_raw = facts.get("location_country")
+        country_code_new = _normalize_country_to_iso2(country_raw)
+        if country_code_new and country_code_new != self.manufacturer.country_code:
+            updated_data["country_code"] = country_code_new
+
+        # Voor nu laten we website_url ongemoeid; die komt uit je eigen invoer.
+        # Later kunnen we, als we Wikipedia/Wikidata erbij nemen, een extra check toevoegen.
+
+        # 5. Diff bepalen – alleen velden die echt veranderen
+        diff = create_suggestion_diff(current_data, updated_data)
+
+        if not diff:
+            return {
+                "message": "Geen nieuwe informatie gevonden in deze URL.",
+                "source_page_id": source_page.id,
+            }
+
+        # 6. DataSuggestion aanmaken
+        suggestion = models.DataSuggestion(
+            entity_type="manufacturer",
+            entity_id=self.manufacturer.id,
+            current_data=current_data,
+            suggested_data=diff,
+            source_url=url,
+        )
+
+        self.db.add(suggestion)
+        self.db.commit()
+        self.db.refresh(suggestion)
+
+        return {
+            "message": "Extractie voor manufacturer voltooid (AI multi-source + heuristiek).",
+            "suggestion_id": suggestion.id,
+            "source_page_id": source_page.id,
+            "suggested_data": diff,
+        }

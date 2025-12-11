@@ -46,6 +46,11 @@ class ParkBase(BaseModel):
         None, min_length=2, max_length=2, description="ISO 3166-1 alpha-2, bv. NL"
     )
     website_url: Optional[str] = None
+    opening_year: int | None = None
+    opening_month: int | None = None
+    opening_day: int | None = None
+    latitude: float | None = None
+    longitude: float | None = None
     notes: Optional[str] = None
 
 

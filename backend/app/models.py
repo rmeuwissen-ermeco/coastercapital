@@ -25,6 +25,11 @@ class Park(Base):
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     name = Column(String, nullable=False, index=True)
     country_code = Column(String(2), nullable=True)  # bv. "NL"
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    opening_year = Column(Integer, nullable=True)
+    opening_month = Column(Integer, nullable=True)
+    opening_day = Column(Integer, nullable=True)
     website_url = Column(String, nullable=True)
     notes = Column(String, nullable=True)
 
@@ -98,10 +103,11 @@ class SourcePage(Base):
 
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     entity_type = Column(String, nullable=False)  # manufacturer / park / coaster
-    entity_id = Column(String, nullable=True)     # mag null zijn bij nieuwe suggestions
+    entity_id = Column(String, nullable=True)     # mag null zijn bij nieuwe records
     url = Column(String, nullable=False)
 
     status_code = Column(String, nullable=True)
     fetched_at = Column(DateTime(timezone=True), server_default=func.now())
     raw_html = Column(String, nullable=True)
     clean_text = Column(String, nullable=True)
+
